@@ -1,0 +1,122 @@
+import { Keyring } from '@polkadot/keyring';
+import { signatureVerify } from '@polkadot/util-crypto';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Buffer } from 'buffer';
+import { buildEncryptedReceiptObj } from '../services/encryption/cryptoUtils';
+import { getSecureValue } from '../services/storage/secureStorage';
+
+export interface ReturnReceipt {
+  receipt_id: string;
+  original_receipt_id: string;
+  status: string;
+  signatures: {
+    issuer: string;
+    returner: string;
+  };
+  merchant: {
+    name: string;
+    logoUrl?: string;
+    businessId: string;
+    address: string;
+  };
+  sender: {
+    address: string;
+  };
+  items: Array<{
+    id: string;
+    name: string;
+    price: number;
+    qty: number;
+    discount?: number;
+    total?: number;
+    returnable: boolean;
+    returned_qty?: number;
+  }>;
+  currency: string;
+  subtotal: number;
+  discount: number;
+  tax: number;
+  total: number;
+  returns: {
+    total_returns: number;
+    returned_amount: number;
+  };
+  metadata: {
+    chain: string;
+    version: string;
+    network: string;
+  };
+}
+
+export interface SignatureData {
+  signature: string;
+  ed25519Address: string;
+  sr25519Address: string;
+}
+
+export async function verifyAndSignReturnReceipt(
+  returnObj: ReturnReceipt,
+  signatureData: SignatureData
+): Promise<{ signedReceipt: ReturnReceipt; encryptedReceipt: any }> {
+  // Verify the returner's signature
+  const isValid = signatureVerify(
+    JSON.stringify(returnObj),
+    signatureData.signature,
+    signatureData.sr25519Address
+  ).isValid;
+
+  if (!isValid) {
+    throw new Error('Invalid signature');
+  }
+
+  // Get seller's mnemonic
+  const currentAccount = await AsyncStorage.getItem('currentAccount');
+  if (!currentAccount) {
+    throw new Error('No current account found');
+  }
+  const sellerMnemonic = await getSecureValue(`mnemonic_${currentAccount}`);
+  if (!sellerMnemonic) {
+    throw new Error('Seller mnemonic not found');
+  }
+
+  // Create unsigned receipt for seller signature
+  const unsignedReceipt = {
+    ...returnObj,
+    signatures: {
+      issuer: '',
+      returner: ''
+    }
+  };
+
+  const messageToSign = JSON.stringify(unsignedReceipt);
+
+  // Sign with seller's SR25519 key
+  const srKeyring = new Keyring({ type: 'sr25519' });
+  const sellerPair = srKeyring.addFromUri(sellerMnemonic);
+  const sellerSignature = sellerPair.sign(messageToSign);
+  const sellerSignatureHex = '0x' + Buffer.from(sellerSignature).toString('hex');
+
+  // Create final signed receipt
+  const signedReceipt: ReturnReceipt = {
+    ...returnObj,
+    signatures: {
+      issuer: sellerSignatureHex,
+      returner: signatureData.signature
+    }
+  };
+
+  // Get seller's Ed25519 address for encryption
+  const edKeyring = new Keyring({ type: 'ed25519' });
+  const sellerEd25519 = edKeyring.addFromUri(sellerMnemonic).address;
+
+  // Create encrypted receipt object
+  const encryptedReceipt = buildEncryptedReceiptObj(
+    signedReceipt,
+    [
+      { address: signatureData.ed25519Address }, // Buyer
+      { address: sellerEd25519 } // Seller
+    ]
+  );
+
+  return { signedReceipt, encryptedReceipt };
+} 
